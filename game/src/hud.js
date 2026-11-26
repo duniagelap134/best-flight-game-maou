@@ -35,6 +35,7 @@ export function drawHud(ctx, w, h, f, time) {
   drawHorizon(ctx, w, h, f);
   drawThrottleFuel(ctx, w, h, f);
   drawMission(ctx, w, h, f, time);
+  drawWind(ctx, w, h, f, r, time);
   drawWarnings(ctx, w, h, f, time);
   drawObjectiveArrow(ctx, w, h, f, obj);
   if (f.message && time < f.messageUntil) {
@@ -238,9 +239,9 @@ function drawThrottleFuel(ctx, w, h, f) {
 }
 
 function drawMission(ctx, w, h, f, time) {
-  // Top-right: mission, rings, timer, score — clear of the altitude tape.
+  // Top-right: mission, rings, timer, score, combo — clear of the altitude tape.
   const x0 = w - 250, y0 = 66;
-  panel(ctx, x0, y0, 236, 104);
+  panel(ctx, x0, y0, 236, 122);
   ctx.fillStyle = '#ffd25a';
   ctx.font = 'bold 13px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
@@ -265,7 +266,58 @@ function drawMission(ctx, w, h, f, time) {
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 20px sans-serif';
   ctx.fillText(`SCORE ${f.score}`, x0 + 14, y0 + 96);
+  // Combo: the chain the pilot is riding, and what it is worth per ring.
+  ctx.font = 'bold 13px sans-serif';
+  if (f.combo > 1) {
+    ctx.fillStyle = '#ffd25a';
+    ctx.fillText(`COMBO x${f.combo}  ·${(1 + (f.combo - 1) * 0.25).toFixed(2)}  BEST x${f.maxCombo}`, x0 + 14, y0 + 112);
+  } else {
+    ctx.fillStyle = 'rgba(255,233,184,0.55)';
+    ctx.fillText(`COMBO —  BEST x${f.maxCombo}`, x0 + 14, y0 + 112);
+  }
   void time;
+}
+
+// The wind indicator: a small panel under the compass with a live arrow,
+// the speed in knots, and the gust above the base wind. The arrow points
+// where the air is going, rotated against the nose, so a crosswind from the
+// left reads as an arrow pointing left across the panel. In Storm Front the
+// panel turns amber while a gust is blowing.
+function drawWind(ctx, w, h, f, r, time) {
+  const cw = 210, ch = 46;
+  const x0 = (w - cw) / 2, y0 = 126;
+  const gusting = f.mission.id === 'stormFront' && r.windGust > 5;
+  ctx.fillStyle = gusting ? 'rgba(90,52,10,0.72)' : PANEL;
+  ctx.strokeStyle = gusting ? '#ffb347' : PANEL_LINE;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.roundRect(x0, y0, cw, ch, 10);
+  ctx.fill(); ctx.stroke();
+  // Arrow: relative wind direction against the heading, nose-up = headwind.
+  const rel = ((r.windDir - r.heading + 540) % 360) - 180;
+  const ax = x0 + 26, ay = y0 + ch / 2;
+  const ang = rel * Math.PI / 180;
+  const len = 15;
+  ctx.strokeStyle = '#7fd0ff';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(ax - Math.sin(ang) * len, ay + Math.cos(ang) * len);
+  ctx.lineTo(ax + Math.sin(ang) * len, ay - Math.cos(ang) * len);
+  ctx.stroke();
+  ctx.fillStyle = '#7fd0ff';
+  ctx.beginPath();
+  ctx.moveTo(ax + Math.sin(ang) * (len + 7), ay - Math.cos(ang) * (len + 7));
+  ctx.lineTo(ax + Math.sin(ang + 2.6) * len, ay - Math.cos(ang + 2.6) * len);
+  ctx.lineTo(ax + Math.sin(ang - 2.6) * len, ay - Math.cos(ang - 2.6) * len);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = CREAM;
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(`WIND ${r.windSpeed} KT`, x0 + 52, y0 + ch / 2 - 8);
+  ctx.font = '12px sans-serif';
+  ctx.fillStyle = gusting ? '#ffb347' : 'rgba(255,233,184,0.75)';
+  ctx.fillText(gusting ? `GUSTING +${r.windGust} KT` : `FROM ${String((r.windDir + 180) % 360).padStart(3, '0')}°`, x0 + 52, y0 + ch / 2 + 10);
+  void h; void time;
 }
 
 function drawWarnings(ctx, w, h, f, time) {
@@ -284,6 +336,13 @@ function drawWarnings(ctx, w, h, f, time) {
     ctx.fillStyle = '#ff5b4d';
     ctx.font = 'bold 18px sans-serif';
     ctx.fillText('ENGINE OUT — GLIDING', w / 2, h * 0.36);
+  }
+  // Storm Front: a gust banner while the gale is at its worst, so the
+  // pilot knows the push on the jet is about to change.
+  if (f.mission.id === 'stormFront' && f.wind && f.wind.gust > 5 && blink) {
+    ctx.fillStyle = '#ffb347';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(`STORM GUST +${Math.round(f.wind.gust)} KT — HOLD THE CRAB`, w / 2, h * 0.20);
   }
 }
 
@@ -327,13 +386,20 @@ export function drawTitle(ctx, w, h, f, time, missionId) {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText('A volcanic island at sunset. Eight gold rings down the valley.', w / 2, h * 0.285);
   ctx.fillText('Thread them all, then put her down gently on runway 18.', w / 2, h * 0.315);
-  // Mission cards.
-  const cardW = Math.min(330, w * 0.36), cardH = 92, gap = 24;
-  const x0 = w / 2 - cardW - gap / 2, x1 = w / 2 + gap / 2;
+  // Mission cards: three across now — Ring Run, Time Trial, Storm Front.
+  const cardW = Math.min(300, w * 0.30), cardH = 92, gap = 18;
+  const totalW = cardW * 3 + gap * 2;
+  const xStart = (w - totalW) / 2;
   const y0 = h * 0.36;
-  for (const [i, id] of ['ringRun', 'timeTrial'].entries()) {
+  const missionIds = ['ringRun', 'timeTrial', 'stormFront'];
+  const missionFooters = {
+    ringRun: 'Fuel 100 · Rings +250',
+    timeTrial: 'Fuel 55 · Rings +150 · Beat the clock',
+    stormFront: 'Fuel 100 · Rings +300 · Wind 26 kt + gusts',
+  };
+  for (const [i, id] of missionIds.entries()) {
     const m = MISSIONS[id];
-    const x = i === 0 ? x0 : x1;
+    const x = xStart + i * (cardW + gap);
     const selected = missionId === id;
     ctx.fillStyle = selected ? 'rgba(255,210,90,0.22)' : PANEL;
     ctx.strokeStyle = selected ? '#ffd25a' : PANEL_LINE;
@@ -347,13 +413,13 @@ export function drawTitle(ctx, w, h, f, time, missionId) {
     ctx.font = '14px sans-serif';
     ctx.fillText(m.blurb, x + cardW / 2, y0 + 52, cardW - 24);
     ctx.font = '12px sans-serif';
-    ctx.fillText(id === 'ringRun' ? 'Fuel 100 · Rings +250' : 'Fuel 55 · Rings +150 · Beat the clock', x + cardW / 2, y0 + 74);
+    ctx.fillText(missionFooters[id], x + cardW / 2, y0 + 74);
   }
   // Controls footer.
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 17px sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('ENTER — fly the selected mission      1 / 2 — pick mission', w / 2, h * 0.58);
+  ctx.fillText('ENTER — fly the selected mission      1 / 2 / 3 — pick mission', w / 2, h * 0.58);
   ctx.fillStyle = CREAM;
   ctx.font = '15px sans-serif';
   ctx.fillText('↑ ↓ pitch · ← → bank · SHIFT throttle up · C throttle down · mouse steers too', w / 2, h * 0.625);
@@ -389,7 +455,8 @@ export function drawLanded(ctx, w, h, f) {
   const mm = String(Math.floor(f.time / 60)).padStart(2, '0');
   const ss = String(Math.floor(f.time % 60)).padStart(2, '0');
   ctx.fillText(`Rings ${f.ringsPassed}/8   ·   Landing quality ${f.landingQuality}%   ·   Time ${mm}:${ss}   ·   Fuel left ${Math.round(f.fuel)}`, w / 2, h * 0.50);
-  ctx.fillText(f.ringsPassed === 8 ? 'A perfect run — every ring, and the runway. The island is yours.' : 'Landed safe — fly the rings next time for the full score.', w / 2, h * 0.57);
+  ctx.fillText(`Best combo x${f.maxCombo}   ·   Crosswind at touchdown ${Math.abs(Math.round(f.crosswindAtLanding || 0))} kt   ·   ${Math.abs(Math.round(f.landingAcross || 0))} m off the centreline`, w / 2, h * 0.545);
+  ctx.fillText(f.ringsPassed === 8 ? 'A perfect run — every ring, and the runway. The island is yours.' : 'Landed safe — fly the rings next time for the full score.', w / 2, h * 0.60);
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 17px sans-serif';
   ctx.fillText('ENTER — fly again      R — restart', w / 2, h * 0.66);

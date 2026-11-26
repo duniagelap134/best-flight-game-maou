@@ -2,7 +2,7 @@
 // heightfield, the lit runway, the gold ring course and the chase-view jet.
 // Everything is drawn on one 2D canvas, far to near, from the pilot's camera.
 
-import { groundHeight, groundColor, waterColor, RINGS, RUNWAY, CLOUDS, TREES, VOLCANO } from './world.js';
+import { groundHeight, groundColor, waterColor, RINGS, RUNWAY, CLOUDS, TREES, VOLCANO, ringAt } from './world.js';
 import { clamp, lerp } from './rng.js';
 
 // Sun sits low in the west, so the valley glows and the sea sparkles.
@@ -55,11 +55,16 @@ export function renderScene(ctx, w, h, f, time) {
   const shakeY = f.shake ? Math.cos(time * 39) * f.shake : 0;
 
   drawSky(ctx, w, h, basis, cx, cy, focal);
-  drawClouds(ctx, cam, basis, cx, cy, focal);
-  drawTerrain(ctx, cam, basis, cx, cy, focal, w, h);
+  drawClouds(ctx, cam, basis, cx, cy, focal, time);
+  drawTerrain(ctx, cam, basis, cx, cy, focal, w, h, time, f);
+  drawCloudShadows(ctx, cam, basis, cx, cy, focal, time);
+  drawSunGlitter(ctx, cam, basis, cx, cy, focal, time);
   drawRunway(ctx, cam, basis, cx, cy, focal, time);
   drawRings(ctx, cam, basis, cx, cy, focal, f, time);
   drawTrees(ctx, cam, basis, cx, cy, focal);
+  if (f.mission && f.mission.id === 'stormFront' && (f.state === 'flying' || f.state === 'paused')) {
+    drawStormRain(ctx, w, h, f, time);
+  }
   drawHaze(ctx, w, h);
   drawVignette(ctx, w, h);
   if (shakeX || shakeY) { ctx.translate(shakeX, shakeY); }
@@ -93,8 +98,18 @@ function drawSky(ctx, w, h, basis, cx, cy, focal) {
   }
 }
 
-function drawClouds(ctx, cam, basis, cx, cy, focal) {
-  for (const c of CLOUDS) {
+function cloudDrift(c, i, time) {
+  // Clouds drift east with the wind, a few metres a second, and wrap around
+  // the charted sky so the drift never runs out of clouds. Deterministic in
+  // time, so a screenshot pose always shows the same sky.
+  const x = c.x + time * 7;
+  const wrapped = ((x + 4500) % 9000 + 9000) % 9000 - 4500;
+  return { x: wrapped, y: c.y, z: c.z, size: c.size, shade: c.shade, i };
+}
+
+function drawClouds(ctx, cam, basis, cx, cy, focal, time) {
+  for (let i = 0; i < CLOUDS.length; i++) {
+    const c = cloudDrift(CLOUDS[i], i, time);
     const p = project([c.x, c.y, c.z], cam, basis, cx, cy, focal);
     if (!p || p.x < -400 || p.x > 2000 || p.y < -200 || p.y > 1200) continue;
     const s = Math.min(240, focal * c.size / p.depth);
@@ -110,7 +125,79 @@ function drawClouds(ctx, cam, basis, cx, cy, focal) {
   }
 }
 
-function drawTerrain(ctx, cam, basis, cx, cy, focal, w, h) {
+// Cloud shadows: the nearest clouds throw soft dark patches on the ground
+// below them, drifting with the clouds themselves. Only the six closest
+// clouds are worth the projection; the rest are too far to read as shadows.
+function drawCloudShadows(ctx, cam, basis, cx, cy, focal, time) {
+  const near = CLOUDS
+    .map((c, i) => ({ c: cloudDrift(c, i, time), d: Math.hypot(c.x - cam[0], c.z - cam[2]) }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, 6);
+  for (const { c } of near) {
+    const gy = groundHeight(c.x, c.z);
+    if (gy < 0) continue; // no shadow on open water
+    const p = project([c.x, gy + 1, c.z], cam, basis, cx, cy, focal);
+    if (!p) continue;
+    const s = clamp(focal * c.size * 0.9 / p.depth, 4, 260);
+    ctx.fillStyle = 'rgba(20,26,48,0.13)';
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, s, s * 0.32, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Sun glitter on the sea: a path of bright dashes on the water toward the
+// low sun, twinkling slowly. It only reads where the sea is actually in
+// frame, so every dash is projected and skipped when it is behind the camera.
+function drawSunGlitter(ctx, cam, basis, cx, cy, focal, time) {
+  const sunX = Math.sin(SUN_AZIMUTH), sunZ = -Math.cos(SUN_AZIMUTH);
+  for (let i = 0; i < 44; i++) {
+    const along = 900 + i * 110;
+    const lateral = Math.sin(i * 12.9898) * 1400 + Math.sin(i * 78.233) * 300;
+    const px = sunX * along - sunZ * lateral;
+    const pz = sunZ * along + sunX * lateral;
+    if (groundHeight(px, pz) > 0) continue; // glitter belongs on the water
+    const p = project([px, 1, pz], cam, basis, cx, cy, focal);
+    if (!p) continue;
+    const tw = 0.35 + 0.65 * Math.abs(Math.sin(time * 2.2 + i * 1.7));
+    const s = clamp(focal * 9 / p.depth, 1, 7);
+    ctx.fillStyle = `rgba(255,226,160,${(0.55 * tw).toFixed(2)})`;
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, s * 2.2, s * 0.7, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Storm rain: diagonal streaks blown sideways across the screen, denser
+// while a gust is blowing. Positions come from a hash of the streak index
+// and the frame, so the rain reads as moving without any random state.
+function drawStormRain(ctx, w, h, f, time) {
+  const gust = f.wind ? Math.max(0, f.wind.gust) : 0;
+  const count = 46 + Math.round(gust * 3);
+  const slant = 0.45; // streaks lean with the wind
+  ctx.strokeStyle = 'rgba(190,210,235,0.34)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < count; i++) {
+    const seed = i * 127.1 + Math.floor(time * 14) * 311.7;
+    const hx = Math.abs(Math.sin(seed) * 10000) % 1;
+    const hy = Math.abs(Math.sin(seed * 1.31 + 7) * 10000) % 1;
+    const x = (hx * (w + 200) + time * 260) % (w + 200) - 100;
+    const y = (hy * (h + 200) + time * 520) % (h + 200) - 100;
+    const len = 14 + (i % 5) * 4;
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - len * slant, y + len);
+  }
+  ctx.stroke();
+  // A cold grey wash at the edges while the front is overhead.
+  const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.72);
+  g.addColorStop(0, 'rgba(40,60,90,0)');
+  g.addColorStop(1, 'rgba(40,60,90,0.20)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+}
+
+function drawTerrain(ctx, cam, basis, cx, cy, focal, w, h, time, f) {
   // A fan of sample rows ahead of the camera: the nearest rows start metres
   // from the wheels, so the ground fills the frame even from a parked jet.
   const rows = [6, 10, 16, 24, 34, 48, 68, 96, 135, 190, 265, 370, 520, 730, 1020, 1430, 2000, 2800, 3900, 5000];
@@ -153,7 +240,7 @@ function drawTerrain(ctx, cam, basis, cx, cy, focal, w, h) {
         col = waterColor(-depth);
         // Warm sun glitter on the water near the sun's azimuth.
         const glint = Math.max(0, Math.sin((a.x + d.x) * 0.0021) * Math.sin((a.z + d.z) * 0.0017));
-        if (glint > 0.86) col = [232, 178, 110];
+        if (glint > 0.80) col = [240, 196, 128];
       } else {
         col = groundColor((a.x + d.x) / 2, (a.z + d.z) / 2, hMid);
       }
@@ -164,14 +251,25 @@ function drawTerrain(ctx, cam, basis, cx, cy, focal, w, h) {
       ctx.closePath(); ctx.fill();
     }
   }
-  // The volcano's smoke: a soft dark plume above the peak.
-  const plume = project([VOLCANO.x, 780, VOLCANO.z], cam, basis, cx, cy, focal);
-  if (plume && plume.depth > 0 && plume.depth < 6000) {
-    const s = clamp(focal * 260 / plume.depth, 6, 130);
-    ctx.fillStyle = 'rgba(90,80,95,0.35)';
+  // The volcano's smoke: a column of puffs that rise, drift downwind and
+  // thin out, so the plume is alive instead of a painted smudge. The drift
+  // follows the mission wind — east in a storm, south-east on a calm day —
+  // and the puffs are placed by time alone, so the scene stays deterministic.
+  const wind = f && f.wind ? f.wind : { speed: 7, dir: Math.PI * 0.75 };
+  const windMs = wind.speed * 0.514;
+  for (let k = 0; k < 4; k++) {
+    const age = ((time * 0.12 + k * 0.25) % 1);
+    const px = VOLCANO.x + Math.sin(wind.dir) * windMs * age * 14 + Math.sin(age * 9 + k) * 40;
+    const pz = VOLCANO.z - Math.cos(wind.dir) * windMs * age * 14 + Math.cos(age * 7 + k * 2) * 30;
+    const py = 700 + age * 260;
+    const plume = project([px, py, pz], cam, basis, cx, cy, focal);
+    if (!plume || plume.depth <= 0 || plume.depth >= 6000) continue;
+    const s = clamp(focal * (120 + age * 260) / plume.depth, 6, 150);
+    const alpha = 0.34 * (1 - age * 0.75);
+    ctx.fillStyle = `rgba(90,80,95,${alpha.toFixed(2)})`;
     ctx.beginPath();
-    ctx.ellipse(plume.x, plume.y, s, s * 0.55, -0.3, 0, Math.PI * 2);
-    ctx.ellipse(plume.x + s * 0.7, plume.y - s * 0.35, s * 0.7, s * 0.4, 0.2, 0, Math.PI * 2);
+    ctx.ellipse(plume.x, plume.y, s, s * 0.55, -0.3 + age * 0.2, 0, Math.PI * 2);
+    ctx.ellipse(plume.x + s * 0.6, plume.y - s * 0.3, s * 0.65, s * 0.38, 0.2, 0, Math.PI * 2);
     ctx.fill();
   }
 }
@@ -256,8 +354,10 @@ function drawRunway(ctx, cam, basis, cx, cy, focal, time) {
 }
 
 function drawRings(ctx, cam, basis, cx, cy, focal, f, time) {
-  // Far rings first so near rings paint over them.
-  const ordered = [...RINGS].map((r, i) => ({ r, i })).sort((a, b) => {
+  // Far rings first so near rings paint over them. In Storm Front the rings
+  // hang at their crosswind offsets, so what the pilot sees is what the
+  // physics scores: the same ringAt view both sides use.
+  const ordered = [...RINGS].map((r, i) => ({ r: ringAt(i, f.mission.id), i })).sort((a, b) => {
     const da = Math.hypot(a.r.x - cam[0], a.r.z - cam[2]);
     const db = Math.hypot(b.r.x - cam[0], b.r.z - cam[2]);
     return db - da;

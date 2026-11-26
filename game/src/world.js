@@ -129,6 +129,34 @@ function buildCourse() {
   });
 }
 
+// Storm Front moves the same eight rings sideways across the valley, so the
+// course runs crosswind: each ring sits off the centreline on the opposite
+// side from its neighbour, and the last ring stays over the runway so the
+// landing setup is fair. Offsets are in metres, east positive.
+export const STORM_OFFSETS = [
+  { dx: 85, dy: 0 },
+  { dx: -95, dy: 8 },
+  { dx: 75, dy: -6 },
+  { dx: -85, dy: 6 },
+  { dx: 100, dy: 0 },
+  { dx: -75, dy: -8 },
+  { dx: 90, dy: 6 },
+  { dx: 0, dy: 0 },
+];
+
+// Where ring i actually hangs for a mission: the plain course, or the
+// crosswind course in Storm Front. Passed/near-miss state lives on the base
+// ring, so the mission view and the course state can never disagree.
+export function ringAt(i, missionId) {
+  const base = RINGS[i];
+  if (!base) return null;
+  if (missionId === 'stormFront') {
+    const off = STORM_OFFSETS[i] || { dx: 0, dy: 0 };
+    return { ...base, x: base.x + off.dx, y: base.y + off.dy };
+  }
+  return base;
+}
+
 // Distance from a point to the runway centreline, and whether it is over the strip.
 export function runwayFrame(px, pz) {
   const dx = px - RUNWAY.x, dz = pz - RUNWAY.z;

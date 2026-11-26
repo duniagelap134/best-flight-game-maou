@@ -8,7 +8,7 @@ import { renderScene, drawJet } from './render.js';
 import { drawHud, drawTitle, drawPaused, drawLanded, drawCrashed } from './hud.js';
 import { createInput } from './input.js';
 import { createAudio } from './audio.js';
-import { RINGS, RUNWAY, groundHeight } from './world.js';
+import { RINGS, RUNWAY, groundHeight, ringAt } from './world.js';
 import { clamp } from './rng.js';
 
 const canvas = document.getElementById('game');
@@ -38,7 +38,7 @@ function height() { return window.innerHeight; }
 
 function startMission(id) {
   missionId = id;
-  for (const ring of RINGS) { ring.passed = false; ring.nearMissed = false; }
+  for (const ring of RINGS) { ring.passed = false; ring.nearMissed = false; ring.comboLost = false; }
   flight = newFlight(id);
   flight.state = 'flying';
   flight.throttle = 0.55;
@@ -61,6 +61,7 @@ function setStatus(text) {
 // ?shot=play   — mid-flight, banked toward ring 3 over the valley, HUD lit
 // ?shot=low    — low on final approach, runway lights ahead, 7 rings done
 // ?shot=landed — wheels down, win screen with the score breakdown
+// ?shot=storm  — Storm Front mid-flight, wind panel lit, rain in the frame
 // The poses only set state the game itself can reach; the render path is the
 // same one the player sees.
 function applyShot(shot) {
@@ -106,7 +107,25 @@ function applyShot(shot) {
     for (const ring of RINGS) ring.passed = true;
     flight.score = 3420;
     flight.landingQuality = 92;
+    flight.maxCombo = 8; flight.combo = 8;
+    flight.crosswindAtLanding = 5; flight.landingAcross = 2;
     flight.state = 'landed';
+    return;
+  }
+  if (shot === 'storm') {
+    // Storm Front mid-flight: banked toward the crosswind ring 3, combo x2,
+    // the wind panel lit and rain streaking across the frame. The pose only
+    // sets state the game itself can reach; the render path is the same one
+    // the player sees.
+    startMission('stormFront');
+    flight.x = -420; flight.z = -60;
+    flight.y = 240;
+    flight.heading = 2.85; flight.pitch = 0.02; flight.roll = -0.35;
+    flight.speed = 172; flight.throttle = 0.82; flight.fuel = 81;
+    flight.ringsPassed = 2; flight.nextRing = 2;
+    flight.combo = 2; flight.maxCombo = 2;
+    RINGS[0].passed = true; RINGS[1].passed = true;
+    flight.score = 720; flight.time = 74;
     return;
   }
 }
@@ -120,7 +139,8 @@ window.__ember = {
   flight: () => flight,
   start: startMission,
   shot: applyShot,
-  rings: () => RINGS.map((r) => ({ x: r.x, y: r.y, z: r.z, passed: r.passed })),
+  rings: () => RINGS.map((r, i) => { const p = ringAt(i, missionId); return { x: p.x, y: p.y, z: p.z, passed: p.passed }; }),
+  ground: (x, z) => groundHeight(x, z),
 };
 
 // ---- Main loop ------------------------------------------------------------
@@ -152,6 +172,7 @@ function frame(now) {
   if (flight.state === 'title') {
     if (input.consume('Digit1')) missionId = 'ringRun';
     if (input.consume('Digit2')) missionId = 'timeTrial';
+    if (input.consume('Digit3')) missionId = 'stormFront';
   }
 
   // Physics, only while flying.

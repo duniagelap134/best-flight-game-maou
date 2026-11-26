@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/best-flight-game-20261126-0057/duniagelap134/best-flight-game-maou/rank.svg)](https://make.fun/bounty/best-flight-game-20261126-0057/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-flight-game-20261126-0057)
 [![reward](https://make.fun/badge/best-flight-game-20261126-0057/duniagelap134/best-flight-game-maou/reward.svg)](https://make.fun/bounty/best-flight-game-20261126-0057?utm_source=github&utm_medium=readme&utm_campaign=best-flight-game-20261126-0057)
 
-Ember Isle — Golden Hour Run: a 3D chase-view flight game over a volcanic island at sunset. Thread 8 gold rings down the coastal valley, watch your fuel, mind the ridges — a scrape bends the jet — then put her down gently on runway 18. Two missions (Ring Run and Canyon Time Trial), a damage model, and a full lit HUD: compass tape, speed and altitude tapes, artificial horizon, throttle, fuel and ring counter.
+Ember Isle — Golden Hour Run: a 3D chase-view flight game over a volcanic island at sunset. Thread 8 gold rings down the coastal valley, watch your fuel, mind the ridges — a scrape bends the jet — then put her down gently on runway 18. Three missions (Ring Run, Canyon Time Trial, and Storm Front — eight rings in a crosswind gale, with a live wind system, gusts, and a ring combo multiplier), a damage model, and a full lit HUD: compass tape, speed and altitude tapes, artificial horizon, wind indicator, throttle, fuel and ring counter.
 
 ## Run it
 
