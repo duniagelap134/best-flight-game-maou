@@ -1,85 +1,87 @@
-// Input for Ember Isle: keyboard and mouse. Arrows or WASD fly the jet,
-// Shift feeds the throttle, C bleeds it, R restarts, P pauses, M mutes, and
-// Enter starts. The mouse steers too: hold the button and the jet follows the
-// pointer's offset from the centre of the screen.
-
+// Ember Isle — keyboard and mouse input.
+// Keys: W/S or Up/Down throttle, A/D or Left/Right bank, Up/Down arrows
+// also pitch the nose, P pause, R restart, 1/2/3 pick a mission, M mute.
+// The mouse steers too: hold the button and move — left/right banks, up/down
+// pitches. Returns a fresh input snapshot every frame; the game reads it
+// and the autopilot (only under ?auto=1) can override it.
 export function createInput(canvas) {
+  const keys = new Set();
   const input = {
-    pitchUp: false, pitchDown: false,
-    rollLeft: false, rollRight: false,
-    throttleUp: false, throttleDown: false,
-    mouseSteer: false,
-    mouseX: 0, mouseY: 0,
-    pressed: {}, // one-shot keys, consumed by the main loop
+    pitch: 0,
+    roll: 0,
+    throttle: 0,
+    mouse: { active: false, dx: 0, dy: 0 },
+    pressed: new Set(),
   };
 
-  const KEYMAP = {
-    ArrowUp: 'pitchUp', KeyW: 'pitchUp',
-    ArrowDown: 'pitchDown', KeyS: 'pitchDown',
-    ArrowLeft: 'rollLeft', KeyA: 'rollLeft',
-    ArrowRight: 'rollRight', KeyD: 'rollRight',
-    ShiftLeft: 'throttleUp', ShiftRight: 'throttleUp',
-    KeyC: 'throttleDown', ControlLeft: 'throttleDown',
-  };
+  function keyName(e) {
+    return e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  }
 
-  window.addEventListener('keydown', (event) => {
-    if (event.repeat) return;
-    const held = KEYMAP[event.code];
-    if (held) {
-      input[held] = true;
-      event.preventDefault();
+  window.addEventListener('keydown', (e) => {
+    const k = keyName(e);
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+      e.preventDefault();
     }
-    input.pressed[event.code] = true;
-    if (event.code === 'Space') event.preventDefault();
+    if (!keys.has(k)) input.pressed.add(k);
+    keys.add(k);
+  });
+  window.addEventListener('keyup', (e) => {
+    keys.delete(keyName(e));
+  });
+  window.addEventListener('blur', () => keys.clear());
+
+  canvas.addEventListener('mousedown', (e) => {
+    input.mouse.active = true;
+    input.mouse.dx = 0;
+    input.mouse.dy = 0;
+    input.mouse.x = e.clientX;
+    input.mouse.y = e.clientY;
+  });
+  window.addEventListener('mouseup', () => {
+    input.mouse.active = false;
+    input.mouse.dx = 0;
+    input.mouse.dy = 0;
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!input.mouse.active) return;
+    input.mouse.dx = (e.clientX - (input.mouse.x ?? e.clientX)) / 120;
+    input.mouse.dy = (e.clientY - (input.mouse.y ?? e.clientY)) / 120;
   });
 
-  window.addEventListener('keyup', (event) => {
-    const held = KEYMAP[event.code];
-    if (held) input[held] = false;
-  });
-
-  window.addEventListener('blur', () => {
-    input.pitchUp = input.pitchDown = false;
-    input.rollLeft = input.rollRight = false;
-    input.throttleUp = input.throttleDown = false;
-    input.mouseSteer = false;
-  });
-
-  canvas.addEventListener('pointerdown', (event) => {
-    input.mouseSteer = true;
-    input.mouseX = event.clientX;
-    input.mouseY = event.clientY;
-  });
-  canvas.addEventListener('pointermove', (event) => {
-    if (!input.mouseSteer) return;
-    input.mouseX = event.clientX;
-    input.mouseY = event.clientY;
-  });
-  window.addEventListener('pointerup', () => { input.mouseSteer = false; });
-
-  // Fold the mouse offset into the stick each frame: pointer right of centre
-  // banks right, pointer above centre pitches up.
-  input.applyMouse = function applyMouse(w, h) {
-    if (!input.mouseSteer) return;
-    const nx = (input.mouseX - w / 2) / (w / 2);
-    const ny = (input.mouseY - h / 2) / (h / 2);
-    input.rollRight = nx > 0.12;
-    input.rollLeft = nx < -0.12;
-    input.pitchUp = ny < -0.12;
-    input.pitchDown = ny > 0.12;
+  input.poll = function poll() {
+    const down = (a, b) => keys.has(a) || (b && keys.has(b));
+    let pitch = 0;
+    let roll = 0;
+    let throttle = 0;
+    if (down('arrowup')) pitch += 1;
+    if (down('arrowdown')) pitch -= 1;
+    if (down('arrowleft', 'a')) roll -= 1;
+    if (down('arrowright', 'd')) roll += 1;
+    if (down('w')) throttle += 1;
+    if (down('s')) throttle -= 1;
+    if (down('shift')) throttle += 0.6;
+    if (down('control')) throttle -= 0.6;
+    if (input.mouse.active) {
+      roll += Math.max(-1, Math.min(1, input.mouse.dx));
+      pitch -= Math.max(-1, Math.min(1, input.mouse.dy));
+    }
+    input.pitch = Math.max(-1, Math.min(1, pitch));
+    input.roll = Math.max(-1, Math.min(1, roll));
+    input.throttle = Math.max(-1, Math.min(1, throttle));
+    return input;
   };
 
-  input.consume = function consume(code) {
-    if (input.pressed[code]) {
-      delete input.pressed[code];
+  // One-shot keys: true once per press, consumed by the caller.
+  input.take = function take(k) {
+    if (input.pressed.has(k)) {
+      input.pressed.delete(k);
       return true;
     }
     return false;
   };
-
   input.clearPressed = function clearPressed() {
-    input.pressed = {};
+    input.pressed.clear();
   };
-
   return input;
 }

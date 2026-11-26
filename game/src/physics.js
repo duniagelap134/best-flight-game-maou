@@ -1,325 +1,268 @@
-// The flight model for Ember Isle: an arcade jet that rewards throttle and turn
-// discipline. Speed comes from the throttle, lift from speed, turns from bank,
-// and the ground, the sea and a hard landing all end the flight. Fuel drains
-// with throttle, and damage from rough handling degrades the airframe: a bent
-// jet flies slower, shakes, and answers the stick late.
+// Ember Isle — flight physics. Arcade, deterministic, and testable in Node:
+// every step is a pure function of (state, input, dt) plus the wind, which
+// itself is a pure function of mission time. No Math.random anywhere.
+import {
+  terrainHeight,
+  surfaceHeight,
+  onRunway,
+  runwayCentreDistance,
+  windAt,
+  crosswindKt,
+  ringsFor,
+  RING_RADIUS,
+  RING_NEAR_BAND,
+  RUNWAY,
+  VOLCANO,
+  CRATER,
+} from './world.js';
 
-import { clamp, wrapAngle, lerp } from './rng.js';
-import { groundHeight, RINGS, RUNWAY, runwayFrame, ringAt } from './world.js';
+export const STALL_SPEED = 30; // m/s: slower than this with the nose up, you sink
+export const MAX_SPEED = 96;
+export const RING_POINTS = 300;
 
-// The wind: a direction the air blows TOWARD, in heading radians (0 = north,
-// PI/2 = east), and a speed in knots. Every mission has wind — a light breeze
-// on the calm days, a gale in Storm Front — and the gusts are a pure function
-// of mission time, so two flights with the same inputs see the same sky.
-// The breeze blows from the north-west toward the south-east; the storm
-// blows straight in from the west, across the valley and across the runway.
-export const WIND = {
-  calm: { base: 7, dir: Math.PI * 0.75, gustAmp: 2 },
-  storm: { base: 26, dir: Math.PI / 2, gustAmp: 11 },
-};
+const KT_TO_MS = 0.514444;
 
-export function windAt(time, missionId) {
-  const spec = missionId === 'stormFront' ? WIND.storm : WIND.calm;
-  // Two slow sines, out of phase, so gusts swell and fade instead of
-  // ticking like a metronome. Deterministic: same time, same gust.
-  const gust = Math.sin(time * 0.9) * 0.6 * spec.gustAmp
-    + Math.sin(time * 0.37 + 1.7) * 0.4 * spec.gustAmp;
-  const speed = Math.max(0, spec.base + gust);
-  return { speed, dir: spec.dir, gust: speed - spec.base };
-}
-
-// Crosswind across the runway strip, in knots: positive blows east across
-// a southbound landing on 18. The runway axis runs north-south, so the
-// crosswind is the wind's east component.
-export function crosswindKt(wind) {
-  return wind.speed * Math.sin(wind.dir);
-}
-
-export const MISSIONS = {
-  ringRun: {
-    id: 'ringRun',
-    name: 'RING RUN',
-    blurb: 'Thread all 8 gold rings down the valley, then land on runway 18.',
-    fuel: 100, fuelDrain: 0.55, ringScore: 250, timeBonus: true,
-  },
-  timeTrial: {
-    id: 'timeTrial',
-    name: 'CANYON TIME TRIAL',
-    blurb: 'Same 8 rings, half the fuel, against the clock. Fast is everything.',
-    fuel: 55, fuelDrain: 0.85, ringScore: 150, timeBonus: true,
-  },
-  stormFront: {
-    id: 'stormFront',
-    name: 'STORM FRONT',
-    blurb: 'Eight rings in a crosswind gale. Crab into the wind, hold the line.',
-    fuel: 100, fuelDrain: 0.6, ringScore: 300, timeBonus: true,
-  },
-};
-
-export function newFlight(missionId) {
-  const mission = MISSIONS[missionId] || MISSIONS.ringRun;
+export function createFlight(mission) {
+  const rings = ringsFor(mission);
   return {
     mission,
-    // Position: parked at the runway threshold, facing north down the strip.
-    x: RUNWAY.x, z: RUNWAY.z + RUNWAY.length / 2 - 60, y: groundHeight(RUNWAY.x, RUNWAY.z + RUNWAY.length / 2 - 60) + 2,
-    heading: 0, pitch: 0, roll: 0,
-    speed: 0, // knots-ish, 0..260
-    throttle: 0,
-    verticalSpeed: 0,
-    fuel: mission.fuel,
-    damage: 0, // 0..100; past 70 the jet barely answers
-    score: 0,
-    ringsPassed: 0,
-    nextRing: 0,
+    mode: 'flying',
     time: 0,
-    state: 'title', // title | flying | paused | landed | crashed
-    crashReason: '',
-    landingQuality: 0, // 0..100, softness of the touchdown
+    timeLeft: mission === 2 ? 150 : null,
+    pos: { x: 0, y: RUNWAY.elevation + 2, z: RUNWAY.zStart + 60 },
+    heading: 0, // radians, 0 = north, clockwise
+    pitch: 0,
+    roll: 0,
+    speed: 0,
+    throttle: 0,
+    fuel: 100,
+    damage: 0,
+    score: 0,
+    combo: 0,
+    bestCombo: 0,
+    rings,
+    ringIndex: 0,
+    ringsHit: rings.map(() => false),
+    nearMissArmed: false,
+    nearMissRing: -1,
+    minRingDist: Infinity,
+    stall: false,
+    airborneOnce: false,
+    verticalSpeed: 0,
+    groundSpeed: 0,
     message: '',
-    messageUntil: 0,
-    stallWarn: false,
-    pullUpWarn: false,
-    engineOut: false,
-    shake: 0,
-    // Wind, combo and landing detail for Storm Front and the HUD.
-    wind: windAt(0, missionId),
-    combo: 0, // consecutive rings threaded without a scrape or a miss
-    maxCombo: 0,
-    closestToRing: Infinity, // closest the jet has come to the current ring
-    nearMissArmed: false, // true while the jet is inside the current ring's scrape band
-    crosswindAtLanding: 0,
-    landingAcross: 0, // metres off the centreline at touchdown
-    maxHeightAbove: 0, // highest the jet has flown above the ground: a landing
-    // only counts once the jet has actually been airborne.
-    grazed: false,
+    messageTime: 0,
+    landedQuality: null,
+    offCentre: null,
+    crosswindAtLanding: null,
+    crashReason: '',
+    ringsScored: 0,
   };
 }
 
-// One physics step, dt in seconds. Input is the held-keys object from input.js.
-export function stepFlight(f, input, dt) {
-  if (f.state !== 'flying') return;
-  f.time += dt;
+export function ringNormal(rings, i) {
+  const cur = rings[i];
+  const prev = i === 0
+    ? { x: 0, y: RUNWAY.elevation + 2, z: RUNWAY.zStart + 60 }
+    : rings[i - 1];
+  const dx = cur.x - prev.x;
+  const dy = cur.y - prev.y;
+  const dz = cur.z - prev.z;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  return { x: dx / len, y: dy / len, z: dz / len };
+}
 
-  // --- Wind: gusts swell and fade with mission time; the HUD reads f.wind ---
-  f.wind = windAt(f.time, f.mission.id);
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 
-  // --- Throttle and engine ---
-  if (input.throttleUp) f.throttle = clamp(f.throttle + dt * 0.55, 0, 1);
-  if (input.throttleDown) f.throttle = clamp(f.throttle - dt * 0.7, 0, 1);
-  const maxSpeed = 260 * (1 - f.damage * 0.004); // damage caps top speed
-  const targetSpeed = f.fuel > 0 ? 40 + f.throttle * (maxSpeed - 40) : 0;
-  const accel = f.fuel > 0 ? 26 : 10;
-  f.speed += clamp(targetSpeed - f.speed, -accel * dt, accel * dt * 0.8);
-  if (f.fuel <= 0 && !f.engineOut) {
-    f.engineOut = true;
-    f.message = 'FUEL EMPTY — GLIDE TO THE RUNWAY';
-    f.messageUntil = f.time + 4;
+function note(state, text) {
+  state.message = text;
+  state.messageTime = 3;
+}
+
+export function landingQuality(state) {
+  const cross = state.crosswindAtLanding ?? 0;
+  const off = state.offCentre ?? 0;
+  const sink = Math.abs(state.verticalSpeed);
+  const speedOff = Math.abs(state.speed - 38);
+  const q = 100 - cross * 1 - off * 0.8 - sink * 3 - speedOff * 0.5;
+  return Math.max(5, Math.min(100, Math.round(q)));
+}
+
+// One fixed step. input: { pitch: -1..1 (positive pulls the nose up),
+// roll: -1..1 (positive banks right), throttle: -1..1 (delta per second) }.
+export function stepFlight(state, input, dt) {
+  if (state.mode !== 'flying') return state;
+  state.time += dt;
+  if (state.messageTime > 0) state.messageTime -= dt;
+
+  // Throttle and fuel.
+  state.throttle = clamp(state.throttle + (input.throttle || 0) * dt, 0, 1);
+  if (state.fuel > 0) {
+    state.fuel = Math.max(0, state.fuel - (0.25 + state.throttle * 0.75) * 0.55 * dt);
   }
+  const thrust = state.fuel > 0 ? state.throttle : 0;
 
-  // --- Stick: pitch and roll, softened as damage grows ---
-  const authority = 1 - f.damage * 0.006;
-  const rollTarget = (input.rollRight ? 1 : 0) - (input.rollLeft ? 1 : 0);
-  const pitchTarget = (input.pitchUp ? 1 : 0) - (input.pitchDown ? 1 : 0);
-  const rollRate = 1.9 * authority, pitchRate = 1.1 * authority;
-  f.roll += clamp(rollTarget * 1.15 - f.roll, -rollRate * dt, rollRate * dt);
-  f.pitch += clamp(pitchTarget * 0.42 - f.pitch, -pitchRate * dt, pitchRate * dt);
-  // Wings level themselves gently when the stick is centred.
-  if (rollTarget === 0) f.roll = lerp(f.roll, 0, dt * 0.55);
-  if (pitchTarget === 0) f.pitch = lerp(f.pitch, 0, dt * 0.8);
+  // Speed: thrust against drag, plus a little help rolling down the strip.
+  const drag = 0.0028 * state.speed * state.speed;
+  let accel = thrust * 26 - drag;
+  const ground = surfaceHeight(state.pos.x, state.pos.z);
+  const airborne = state.pos.y > ground + 3 || state.speed > 25;
+  if (!airborne && state.speed < 12) accel += 2.5;
+  state.speed = clamp(state.speed + accel * dt, 0, MAX_SPEED);
 
-  // --- Turning: bank turns the nose; pitch trades speed for climb ---
-  // Banking right (positive roll) swings the nose right, toward east.
-  const turnRate = f.roll * (0.55 + f.speed / 420);
-  f.heading = wrapAngle(f.heading + turnRate * dt);
-  const speedMs = f.speed * 0.514;
-  const groundNow = groundHeight(f.x, f.z);
-  const heightNow = f.y - groundNow;
-  const airborne = heightNow > 2;
-  // Below flying speed the wing stops lifting and the nose drops — but only
-  // in the air, and only once the jet has actually flown. A parked jet on the
-  // runway sits still instead of sinking through the concrete, and it cannot
-  // lift off below rotate speed.
-  const stall = f.speed < 78;
-  f.stallWarn = stall && heightNow > 12;
-  const sink = stall && heightNow > 0.5 && f.maxHeightAbove > 3 ? 14 : 0;
-  let climb = Math.sin(f.pitch) * speedMs * 0.9;
-  if (!airborne && f.speed < 70) climb = Math.min(climb, 0);
-  f.verticalSpeed = climb - sink;
-  f.y += f.verticalSpeed * dt;
-  f.x += Math.sin(f.heading) * Math.cos(f.pitch) * speedMs * dt;
-  f.z -= Math.cos(f.heading) * Math.cos(f.pitch) * speedMs * dt;
-  // --- Wind push: the air mass carries the jet across the ground. A parked
-  // jet stays put — the push only bites once airborne (or rolling fast) —
-  // and the heading never changes, so the pilot must crab into the wind to
-  // hold a ground track: nose east of the course when the gale blows east.
-  if (heightNow > 2 || f.speed > 40) {
-    const windMs = f.wind.speed * 0.514;
-    f.x += Math.sin(f.wind.dir) * windMs * dt;
-    f.z -= Math.cos(f.wind.dir) * windMs * dt;
-  }
-  // Soft ceiling and the edge of the charted island.
-  if (f.y > 900) { f.y = 900; f.pitch = Math.min(f.pitch, 0); }
-  const far = Math.hypot(f.x, f.z);
-  if (far > 6800) f.heading = wrapAngle(f.heading + Math.PI); // turn back in
+  // Attitude: the stick sets a target attitude and the jet eases toward
+  // it, so holding the stick holds a climb or a bank instead of winding
+  // the pitch up to the stops. No input eases back to level flight.
+  const targetPitch = (input.pitch || 0) * 0.55;
+  state.pitch += (targetPitch - state.pitch) * Math.min(1, 2.0 * dt);
+  const targetRoll = (input.roll || 0) * 1.1;
+  state.roll += (targetRoll - state.roll) * Math.min(1, 2.5 * dt);
 
-  // --- Fuel burn: throttle and hard manoeuvres drink it ---
-  const burn = f.mission.fuelDrain * (0.25 + f.throttle * 0.75 + Math.abs(f.roll) * 0.25);
-  f.fuel = Math.max(0, f.fuel - burn * dt);
+  // Turning: banked flight turns, faster when you are fast.
+  state.heading += state.roll * (state.speed / 55) * 0.55 * dt;
+  if (state.heading > Math.PI) state.heading -= Math.PI * 2;
+  if (state.heading < -Math.PI) state.heading += Math.PI * 2;
 
-  // --- Damage shake grows with damage ---
-  f.shake = f.damage * 0.02 * (0.5 + Math.abs(Math.sin(f.time * 31)) * 0.5);
+  // Vertical speed: climb on the wing, sink when stalled or slow — but
+  // only in the air. On the ground the wheels hold you up.
+  const groundNow = surfaceHeight(state.pos.x, state.pos.z);
+  const isAirborne = state.pos.y > groundNow + 3 || state.speed > 25;
+  if (isAirborne) state.airborneOnce = true;
+  let vy = state.speed * Math.sin(state.pitch);
+  state.stall = state.speed < STALL_SPEED && state.pitch > 0.12 && isAirborne;
+  if (state.stall) vy -= (STALL_SPEED - state.speed) * 0.9;
+  if (state.speed < 18 && isAirborne) vy -= (18 - state.speed) * 0.35;
+  state.verticalSpeed = vy;
 
-  // --- Rings: fly through the glowing hoop to score. Threading rings in a
-  // row builds a combo: each consecutive ring pays a growing multiplier, so
-  // a clean run is worth far more than eight scattered ones. A scrape in the
-  // near-miss band, or flying clean past a ring after getting close to it,
-  // breaks the chain — the combo, not the rings, is what a sloppy pass costs.
-  const ring = ringAt(f.nextRing, f.mission.id);
-  const baseRing = RINGS[f.nextRing];
-  // ringAt returns a copy for Storm Front (offset positions), so the
-  // passed / near-miss flags always live on the base ring, never the copy.
-  if (ring) {
-    const dx = f.x - ring.x, dy = f.y - ring.y, dz = f.z - ring.z;
-    const d = Math.hypot(dx, dy, dz);
-    f.closestToRing = Math.min(f.closestToRing, d);
-    if (d < ring.radius) {
-      baseRing.passed = true;
-      f.ringsPassed++;
-      f.nextRing++;
-      f.closestToRing = Infinity;
-      f.nearMissArmed = false;
-      f.combo++;
-      f.maxCombo = Math.max(f.maxCombo, f.combo);
-      const mult = 1 + (f.combo - 1) * 0.25;
-      const bonus = Math.round((f.mission.ringScore + Math.round(f.speed / 10)) * mult);
-      f.score += bonus;
-      f.message = f.combo > 1
-        ? `RING ${f.ringsPassed}/8  +${bonus}  COMBO x${f.combo}`
-        : `RING ${f.ringsPassed}/8  +${bonus}`;
-      f.messageUntil = f.time + 2.5;
-    }
-    // Near miss: the scrape band is crossed on every honest approach, so
-    // merely being in it means nothing. The combo only breaks when the jet
-    // leaves the band again without threading the ring — it came close and
-    // flew on by.
-    else {
-      if (d < ring.radius + 26) f.nearMissArmed = true;
-      else if (f.nearMissArmed) {
-        f.nearMissArmed = false;
-        if (!baseRing.nearMissed) {
-          baseRing.nearMissed = true;
-          if (f.combo > 0) {
-            f.combo = 0;
-            f.message = 'SCRAPE — COMBO LOST';
-            f.messageUntil = f.time + 2.5;
-          }
-        }
-      }
-      // Flown clean past the ring after getting close to it: the chain
-      // breaks once, even if the jet never entered the scrape band.
-      if (d > 400 && f.closestToRing < 120 && !baseRing.comboLost) {
-        baseRing.comboLost = true;
-        if (f.combo > 0) {
-          f.combo = 0;
-          f.message = 'RING MISSED — COMBO LOST';
-          f.messageUntil = f.time + 2.5;
-        }
-      }
+  // Wind pushes the ground track, never the heading: you must crab.
+  const wind = windAt(state.mission, state.time);
+  const fx = Math.sin(state.heading);
+  const fz = Math.cos(state.heading);
+  const airX = fx * state.speed;
+  const airZ = fz * state.speed;
+  const push = airborne || state.speed > 25 ? 1 : 0;
+  const gx = airX + wind.x * push;
+  const gz = airZ + wind.z * push;
+  state.pos.x += gx * dt;
+  state.pos.z += gz * dt;
+  state.pos.y += vy * dt;
+  state.groundSpeed = Math.hypot(gx, gz);
+
+  // The clock in the time trial.
+  if (state.timeLeft !== null) {
+    state.timeLeft -= dt;
+    if (state.timeLeft <= 0) {
+      state.timeLeft = 0;
+      state.mode = 'crashed';
+      state.crashReason = 'Out of time — the canyon clock hit zero.';
+      return state;
     }
   }
 
-  // --- Ground, sea and runway ---
-  const ground = groundHeight(f.x, f.z);
-  const frame = runwayFrame(f.x, f.z);
-  const heightAbove = f.y - ground;
-  f.maxHeightAbove = Math.max(f.maxHeightAbove, heightAbove);
-  f.pullUpWarn = heightAbove < 45 && f.verticalSpeed < -4 && f.speed > 90;
-  // Touching the ground resolves here: always within half a metre, and within
-  // 2.5 m when descending onto it or slow over it, so a stalled jet cannot
-  // hover two metres above the strip forever. A fast level low pass does not
-  // count as touching.
-  const descending = f.verticalSpeed < -0.5;
-  const slow = f.speed < 55;
-  if (heightAbove <= 0.5 || (heightAbove <= 2.5 && (descending || slow))) {
-    const onRunway = frame.overStrip && ground < 80;
-    const gentle = Math.abs(f.verticalSpeed) < 9 && Math.abs(f.roll) < 0.35 && f.speed < 150;
-    // Touchdown quality: soft and level is the base, and the wind and the
-    // centreline decide the rest. A crosswind touchdown costs a point per
-    // knot across the strip, and every metre off the centreline costs almost
-    // a point — a greaser in a gale, dead on the paint, is the best landing
-    // this island hands out. The combo pays out here too: the best chain of
-    // the flight is worth 50 points a ring.
-    const cross = crosswindKt(f.wind);
-    f.crosswindAtLanding = cross;
-    f.landingAcross = frame.across;
-    const qualityFor = (base) => Math.round(clamp(
-      base - Math.abs(f.verticalSpeed) * 6 - Math.abs(f.roll) * 40
-      - Math.max(0, f.speed - 120) * 0.4 - Math.abs(cross) * 1.0
-      - Math.abs(frame.across) * 0.8,
-      5, 100));
-    if (onRunway && gentle && f.speed > 55 && f.maxHeightAbove > 15) {
-      // A landing: score the touchdown, then roll out.
-      f.state = 'landed';
-      f.landingQuality = qualityFor(100);
-      const timeBonus = f.mission.timeBonus ? Math.max(0, Math.round((420 - f.time) * 2)) : 0;
-      const ringBonus = f.ringsPassed * 100;
-      const comboBonus = f.maxCombo * 50;
-      f.score += f.landingQuality * 5 + timeBonus + ringBonus + comboBonus;
-      f.y = ground + 1.5;
-    } else if (onRunway && f.speed <= 55 && f.verticalSpeed > -12 && f.maxHeightAbove > 15) {
-      // Rolling out slowly on the strip after a long flare still counts.
-      f.state = 'landed';
-      f.landingQuality = qualityFor(55);
-      f.score += f.landingQuality * 5 + f.ringsPassed * 100 + f.maxCombo * 50;
-      f.y = ground + 1.5;
-    } else if (onRunway && f.maxHeightAbove <= 15) {
-      // Never left the ground: just taxiing on the strip, not a landing.
-      f.y = ground + 1.5;
-      f.verticalSpeed = 0;
+  const nowGround = surfaceHeight(state.pos.x, state.pos.z);
+
+  // The volcano is a hard wall: fly into the cone and you are done.
+  const craterDist = Math.hypot(state.pos.x - CRATER.x, state.pos.z - CRATER.z);
+  if (craterDist < 110 && state.pos.y < CRATER.y + 60 && state.pos.y > nowGround) {
+    state.mode = 'crashed';
+    state.damage = 100;
+    state.crashReason = 'You flew into the volcano.';
+    return state;
+  }
+
+  // Rings: thread, near-miss, or fly past.
+  if (state.ringIndex < state.rings.length) {
+    const ring = state.rings[state.ringIndex];
+    const dx = state.pos.x - ring.x;
+    const dy = state.pos.y - ring.y;
+    const dz = state.pos.z - ring.z;
+    const dist = Math.hypot(dx, dy, dz);
+    state.minRingDist = Math.min(state.minRingDist, dist);
+    if (dist < RING_RADIUS) {
+      const mult = 1 + 0.25 * state.combo;
+      const gained = Math.round(RING_POINTS * mult);
+      state.score += gained;
+      state.combo += 1;
+      state.bestCombo = Math.max(state.bestCombo, state.combo);
+      state.ringsHit[state.ringIndex] = true;
+      state.ringsScored += 1;
+      note(state, `RING ${state.ringIndex + 1}  +${gained}  (combo x${state.combo})`);
+      state.ringIndex += 1;
+      state.nearMissArmed = false;
+      state.minRingDist = Infinity;
     } else {
-      // Terrain, sea or a runway strike too hard to walk away from.
-      const inSea = ground < 2;
-      f.state = 'crashed';
-      f.crashReason = inSea ? 'DITCHED IN THE SEA' : (frame.overStrip ? 'HARD LANDING — AIRFRAME BROKE UP' : 'CONTROLLED FLIGHT INTO TERRAIN');
-      f.y = ground + 1;
+      if (dist < RING_NEAR_BAND) {
+        state.nearMissArmed = true;
+        state.nearMissRing = state.ringIndex;
+      } else if (state.nearMissArmed && dist > RING_NEAR_BAND + 8) {
+        // Left the band without threading it: the combo is gone.
+        if (state.combo > 0) note(state, 'Near miss — combo lost');
+        state.combo = 0;
+        state.nearMissArmed = false;
+      }
+      // Clean fly-past: crossed the ring plane without ever getting close.
+      const n = ringNormal(state.rings, state.ringIndex);
+      const along = dx * n.x + dy * n.y + dz * n.z;
+      if (along > RING_RADIUS + 12 && state.minRingDist > RING_NEAR_BAND) {
+        if (state.combo > 0) note(state, 'Flew past a ring — combo lost');
+        state.combo = 0;
+        state.minRingDist = Infinity;
+      }
     }
   }
-  // Graze: clipping a ridge at speed bends the jet instead of ending it, once.
-  if (heightAbove > 0.5 && heightAbove < 6 && f.speed > 120 && !f.grazed) {
-    f.grazed = true;
-    f.damage = Math.min(100, f.damage + 22);
-    f.message = 'RIDGE STRIKE — DAMAGE 22% — EASE OFF';
-    f.messageUntil = f.time + 3.5;
+
+  // Ground contact. A jet that has never left the ground is just taxiing:
+  // clamp it to the strip and keep rolling, no landing and no crash.
+  if (state.pos.y <= nowGround + 1.5) {
+    state.pos.y = nowGround + 1.5;
+    if (!state.airborneOnce) {
+      state.speed = Math.max(0, state.speed - 5 * dt);
+      return state;
+    }
+    const onStrip = onRunway(state.pos.x, state.pos.z);
+    const gentle = Math.abs(vy) < 6 && state.speed < 52 && state.pitch > -0.18;
+    if (onStrip && gentle) {
+      state.mode = 'landed';
+      state.offCentre = runwayCentreDistance(state.pos.x);
+      state.crosswindAtLanding = crosswindKt(state.mission, state.time);
+      state.landedQuality = landingQuality(state);
+      state.score += state.landedQuality + 50 * state.bestCombo;
+      state.speed = Math.max(0, state.speed - 30 * dt);
+      return state;
+    }
+    if (state.speed > 30 || Math.abs(vy) > 6) {
+      state.mode = 'crashed';
+      state.damage = 100;
+      state.crashReason = onStrip
+        ? 'Hard landing — you came in too fast or too steep.'
+        : 'You hit the terrain.';
+      return state;
+    }
+    // A slow roll-out on rough ground: it just stops you.
+    state.speed = Math.max(0, state.speed - 40 * dt);
+    if (state.speed === 0 && state.pos.y <= nowGround + 1.6) {
+      state.mode = 'crashed';
+      state.crashReason = 'You ran out of runway and stopped in the rough.';
+    }
   }
+
+  // Out of fuel over the sea is a glide, not a crash — until the ground.
+  if (state.fuel <= 0 && state.speed < 8 && !airborne) {
+    state.mode = 'crashed';
+    state.crashReason = 'Out of fuel — you glided to a stop short of the strip.';
+  }
+  return state;
 }
 
-// Heading in degrees (0 = north, 90 = east), speed in knots, altitude in
-// feet, for the HUD. Heading follows the world: east is +90.
-export function flightReadout(f) {
-  const headingDeg = ((f.heading * 180 / Math.PI) % 360 + 360) % 360;
-  const wind = f.wind || windAt(f.time || 0, f.mission.id);
+// Where the aircraft starts a mission: south end of the strip, nose north.
+export function startPose() {
   return {
-    heading: Math.round(headingDeg),
-    speed: Math.round(f.speed),
-    altitude: Math.round(f.y * 3.28084),
-    verticalSpeed: Math.round(f.verticalSpeed * 196.85),
-    fuel: Math.round(f.fuel),
-    damage: Math.round(f.damage),
-    windSpeed: Math.round(wind.speed),
-    windDir: Math.round(((wind.dir * 180 / Math.PI) % 360 + 360) % 360),
-    windGust: Math.round(wind.gust),
-    crosswind: Math.round(crosswindKt(wind)),
+    pos: { x: 0, y: RUNWAY.elevation + 2, z: RUNWAY.zStart + 60 },
+    heading: 0,
+    pitch: 0,
+    roll: 0,
+    speed: 0,
   };
-}
-
-// Bearing and distance from the jet to the current objective (next ring, else runway).
-export function objectiveReadout(f) {
-  let tx, tz, label;
-  const ring = ringAt(f.nextRing, f.mission.id);
-  if (ring) { tx = ring.x; tz = ring.z; label = `RING ${f.nextRing + 1}`; }
-  else { tx = RUNWAY.x; tz = RUNWAY.z; label = 'RUNWAY 18'; }
-  const dx = tx - f.x, dz = tz - f.z;
-  const bearing = ((Math.atan2(dx, -dz) * 180 / Math.PI) % 360 + 360) % 360;
-  const dist = Math.hypot(dx, dz);
-  return { bearing: Math.round(bearing), distance: Math.round(dist), label };
 }

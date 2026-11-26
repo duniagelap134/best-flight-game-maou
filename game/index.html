@@ -5,14 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ember Isle — Golden Hour Run</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a0f2e; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #241640; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   /* Read aloud, never shown: the status line screen readers announce. */
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Ember Isle Golden Hour Run: fly the jet through eight golden rings and land on the island runway"></canvas>
+<canvas id="game" aria-label="Ember Isle: fly a plane through gold rings over a volcanic island at sunset, then land on the runway"></canvas>
 <p id="status" role="status" aria-live="polite"></p>
 <script type="module" src="./src/main.js"></script>
 </body>

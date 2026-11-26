@@ -1,2 +1,4 @@
+node_modules/
 out/
-out2/
+output/
+.DS_Store

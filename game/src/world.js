@@ -1,202 +1,204 @@
-// The island of Ember Isle: one volcanic island in a golden-hour sea, with a
-// coastal valley, a mountain ridge, a beach ring and a lit runway on the flat
-// southern shore. All heights come from the seeded noise in rng.js, so the
-// island never changes between runs.
+// Ember Isle — the world: terrain, runway, rings, wind, clouds, trees.
+// Everything here is a pure function of position or time, so the island is
+// identical on every machine and the physics can be tested in Node.
+import { makeRng, range } from './rng.js';
 
-import { makeFbm, mulberry32, clamp, lerp } from './rng.js';
+export const ISLAND_RADIUS = 2600; // metres from the island centre
+export const SEA_LEVEL = 0;
 
-export const WORLD = {
-  seed: 20261126,
-  // Island radius in metres; beyond it the sea runs flat to the horizon.
-  islandRadius: 5200,
-  // Sea level is height 0; terrain below it is water.
-  seaLevel: 0,
-  // The volcano peak height and the valley floor the course follows.
-  peakHeight: 640,
-  valleyFloor: 55,
-};
+// The volcano rises in the far north-east of the island, clear of the
+// valley course so the rings stay in open air.
+export const VOLCANO = { x: 700, z: 900, height: 430, radius: 420 };
+export const CRATER = { x: 700, z: 900, y: 500, radius: 90 };
 
-// Two noise fields: broad island shape and fine hill detail.
-const islandNoise = makeFbm(WORLD.seed, 4);
-const detailNoise = makeFbm(WORLD.seed + 101, 3);
-const peakRand = mulberry32(WORLD.seed + 7);
-
-// The volcano sits north-west of centre; the runway sits on the flat south shore.
-export const VOLCANO = { x: -1150, z: -1450, radius: 1500 };
+// The runway runs north-south on the flat southern shore.
 export const RUNWAY = {
-  // Centre of the strip (runways 18/36). Takeoff is northbound on 36; the ring
-  // run comes back down the valley and lands southbound on 18.
-  x: 350, z: 2350,
-  heading: 0, // radians, 0 = north (-z)
-  length: 900, width: 46,
-  // Touchdown zone: the first third of the strip, where a good landing counts.
-  touchdownZ: 2350 - 180,
+  x: 0,
+  zStart: -2240, // southern threshold (runway 18)
+  zEnd: -1420, // northern threshold (runway 36)
+  width: 46,
+  heading: 0, // 0 = north, the direction of runway 36
+  elevation: 9,
 };
 
-// Height of the ground at world (x, z), in metres. Sea level is 0.
-export function groundHeight(x, z) {
-  const dx = x, dz = z;
-  const dist = Math.hypot(dx, dz);
-  // Falloff: the island sinks into the sea past its radius.
-  const coast = clamp((WORLD.islandRadius - dist) / 900, 0, 1);
-  const coastSmooth = coast * coast * (3 - 2 * coast);
-  if (coastSmooth <= 0) return -30; // open sea
-  // Broad rolling hills over the whole island.
-  let h = islandNoise(x * 0.00045 + 40, z * 0.00045 + 40) * 260;
-  // Fine detail for ridges and gullies.
-  h += (detailNoise(x * 0.0021 + 9, z * 0.0021 + 9) - 0.5) * 90;
-  // The volcano cone rises in the north-west.
-  const vd = Math.hypot(x - VOLCANO.x, z - VOLCANO.z);
-  const cone = Math.max(0, 1 - vd / VOLCANO.radius);
-  h += cone * cone * WORLD.peakHeight;
-  // A gentle valley runs south from the volcano to the runway: carve it down so
-  // the ring course has a readable low path through the hills.
-  const valley = valleyDepth(x, z);
-  h = lerp(h, WORLD.valleyFloor + detailNoise(x * 0.004, z * 0.004) * 24, valley);
-  // The runway apron is flattened to the valley floor.
-  const apron = apronWeight(x, z);
-  h = lerp(h, WORLD.valleyFloor, apron);
-  // Beach: anything near sea level flattens out to sand.
-  if (h < 14 && coastSmooth > 0.15) h = lerp(h, 6, clamp((14 - h) / 14, 0, 1) * 0.7);
-  return (h - 40) * coastSmooth + 8 * coastSmooth - 30 * (1 - coastSmooth);
-}
+export const RING_RADIUS = 19;
+export const RING_NEAR_BAND = 34;
 
-// How strongly the valley carve applies at (x, z): 1 on the valley centreline.
-export function valleyDepth(x, z) {
-  // Centreline wanders from the volcano's south slope down to the runway.
-  const t = clamp((z + 1400) / 3600, 0, 1);
-  const centreX = lerp(-900, RUNWAY.x, t) + Math.sin(t * 9.1) * 260;
-  const d = Math.abs(x - centreX);
-  const w = clamp(1 - d / 520, 0, 1);
-  return w * w * (0.55 + 0.45 * Math.sin(t * Math.PI));
-}
-
-function apronWeight(x, z) {
-  const dx = Math.abs(x - RUNWAY.x);
-  const dz = Math.abs(z - RUNWAY.z);
-  const wx = clamp(1 - (dx - RUNWAY.width / 2 - 60) / 160, 0, 1);
-  const wz = clamp(1 - (dz - RUNWAY.length / 2 - 60) / 160, 0, 1);
-  return clamp(wx * wz, 0, 1);
-}
-
-// Colour of the ground at a point, by height and slope, as [r, g, b].
-// Golden hour: warm grass, dark pine, pale rock, snow on the peak, sand at shore.
-export function groundColor(x, z, h) {
-  const n = detailNoise(x * 0.006 + 3, z * 0.006 + 3);
-  const jitter = (n - 0.5) * 10;
-  if (h < 2) return [196 + jitter, 168 + jitter, 118 + jitter]; // wet sand
-  if (h < 12) return [214 + jitter, 188 + jitter, 132 + jitter]; // dry sand
-  if (h > 470) return [238 + jitter, 232 + jitter, 226 + jitter]; // snow cap
-  if (h > 300) return [122 + jitter * 0.6, 104 + jitter * 0.6, 92 + jitter * 0.6]; // rock
-  if (h > 150) return [52 + jitter * 0.5, 84 + jitter * 0.5, 44 + jitter * 0.5]; // pine forest
-  return [104 + jitter, 138 + jitter, 62 + jitter]; // warm valley grass
-}
-
-export function waterColor(depth) {
-  const t = clamp(-depth / 60, 0, 1);
-  return [lerp(64, 18, t), lerp(122, 58, t), lerp(148, 108, t)];
-}
-
-// The ring course: eight gold rings threading the valley from the north ridge
-// down to the runway, then the runway itself. Each ring knows its centre, its
-// radius and the heading that threads it cleanly.
-export const RINGS = buildCourse();
-
-function buildCourse() {
-  const rand = mulberry32(WORLD.seed + 31);
-  const stops = [
-    { x: -820, z: -900, y: 300, r: 42 },
-    { x: -560, z: -250, y: 235, r: 40 },
-    { x: -180, z: 320, y: 185, r: 38 },
-    { x: 240, z: 780, y: 165, r: 38 },
-    { x: -120, z: 1180, y: 150, r: 36 },
-    { x: 420, z: 1480, y: 140, r: 36 },
-    { x: 180, z: 1830, y: 125, r: 34 },
-    // The last ring hangs over the runway itself: thread it, then put her
-    // down on the strip still ahead of you.
-    { x: 350, z: 2300, y: 85, r: 34 },
-  ];
-  return stops.map((s, i) => {
-    const ground = groundHeight(s.x, s.z);
-    return {
-      index: i,
-      x: s.x + (rand() - 0.5) * 24,
-      z: s.z + (rand() - 0.5) * 24,
-      y: Math.max(s.y, ground + 55),
-      radius: s.r,
-      passed: false,
-    };
-  });
-}
-
-// Storm Front moves the same eight rings sideways across the valley, so the
-// course runs crosswind: each ring sits off the centreline on the opposite
-// side from its neighbour, and the last ring stays over the runway so the
-// landing setup is fair. Offsets are in metres, east positive.
-export const STORM_OFFSETS = [
-  { dx: 85, dy: 0 },
-  { dx: -95, dy: 8 },
-  { dx: 75, dy: -6 },
-  { dx: -85, dy: 6 },
-  { dx: 100, dy: 0 },
-  { dx: -75, dy: -8 },
-  { dx: 90, dy: 6 },
-  { dx: 0, dy: 0 },
+// The valley course: eight rings from the southern shore, up the valley,
+// and back to the runway approach. The last ring hangs over the approach
+// so a good run ends lined up for landing.
+const COURSE = [
+  { x: 0, y: 150, z: -1020 },
+  { x: 62, y: 172, z: -620 },
+  { x: -68, y: 162, z: -220 },
+  { x: 44, y: 192, z: 190 },
+  { x: -58, y: 182, z: 610 },
+  { x: 72, y: 202, z: 1010 },
+  { x: -120, y: 178, z: 800 },
+  { x: 0, y: 132, z: -1100 },
 ];
 
-// Where ring i actually hangs for a mission: the plain course, or the
-// crosswind course in Storm Front. Passed/near-miss state lives on the base
-// ring, so the mission view and the course state can never disagree.
-export function ringAt(i, missionId) {
-  const base = RINGS[i];
-  if (!base) return null;
-  if (missionId === 'stormFront') {
-    const off = STORM_OFFSETS[i] || { dx: 0, dy: 0 };
-    return { ...base, x: base.x + off.dx, y: base.y + off.dy };
+// Storm Front shoves the rings sideways, alternating sides, so the pilot
+// has to crab into the wind to thread them.
+const STORM_SHIFT = [92, -86, 96, -82, 100, -90, 86, 0];
+
+export function ringsFor(mission) {
+  return COURSE.map((ring, i) => ({
+    x: mission === 3 ? ring.x + STORM_SHIFT[i] : ring.x,
+    y: ring.y,
+    z: ring.z,
+    index: i,
+  }));
+}
+
+// A smooth 0..1 ramp between two edges.
+function smoothstep(a, b, v) {
+  const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+function bump(x, z, cx, cz, height, spread) {
+  const dx = x - cx;
+  const dz = z - cz;
+  return height * Math.exp(-(dx * dx + dz * dz) / (2 * spread * spread));
+}
+
+// Ground height in metres at (x, z). The island is a broad dome with a
+// volcano cone, a few wooded hills, a carved valley along the course, and
+// a flat pad under the runway. Outside the island the sea floor is -12.
+export function terrainHeight(x, z) {
+  const r = Math.hypot(x, z);
+  if (r > ISLAND_RADIUS + 400) return -12;
+  const dome = 74 * (1 - smoothstep(1500, ISLAND_RADIUS, r));
+  const shore = smoothstep(ISLAND_RADIUS, ISLAND_RADIUS - 260, r);
+  let h = dome * shore;
+  h += bump(x, z, VOLCANO.x, VOLCANO.z, VOLCANO.height, VOLCANO.radius);
+  h += bump(x, z, -900, 300, 96, 420);
+  h += bump(x, z, 1050, -500, 82, 380);
+  h += bump(x, z, -1250, -950, 64, 330);
+  h += bump(x, z, 1500, 1300, 88, 360);
+  // Carve the valley so the ring course stays clear of the ground.
+  const valley = Math.exp(-(x * x) / (2 * 190 * 190));
+  const inValley = smoothstep(-1250, -700, z) * (1 - smoothstep(1150, 1650, z));
+  h -= 52 * valley * inValley;
+  // Flatten the runway pad.
+  const onPad =
+    smoothstep(-70, -30, x) * (1 - smoothstep(30, 70, x)) *
+    smoothstep(RUNWAY.zStart - 80, RUNWAY.zStart + 60, z) *
+    (1 - smoothstep(RUNWAY.zEnd - 60, RUNWAY.zEnd + 80, z));
+  h = h * (1 - onPad) + RUNWAY.elevation * onPad;
+  if (r > ISLAND_RADIUS) h = h * (1 - smoothstep(ISLAND_RADIUS, ISLAND_RADIUS + 400, r)) - 12 * smoothstep(ISLAND_RADIUS, ISLAND_RADIUS + 400, r);
+  return Math.max(h, -12);
+}
+
+// The surface you can hit: the terrain on land, the sea surface (y=0)
+// once you are past the shore. Without this a ditching jet would fly
+// on forever underneath the water.
+export function surfaceHeight(x, z) {
+  const r = Math.hypot(x, z);
+  if (r > ISLAND_RADIUS) return Math.max(terrainHeight(x, z), 0);
+  return terrainHeight(x, z);
+}
+
+export function onRunway(x, z) {
+  return (
+    Math.abs(x - RUNWAY.x) <= RUNWAY.width / 2 &&
+    z >= RUNWAY.zStart &&
+    z <= RUNWAY.zEnd
+  );
+}
+
+export function runwayCentreDistance(x) {
+  return Math.abs(x - RUNWAY.x);
+}
+
+// Wind: a pure deterministic function of mission time (seconds).
+// Missions 1-2 get a calm north-west breeze; mission 3 gets a westerly
+// storm with gusts built from two slow sines, so it repeats exactly.
+// Returns { speedKt, fromDeg, x, z } where (x, z) is the wind vector in
+// m/s pointing where the air is going (x east, z north).
+export function windAt(mission, t) {
+  const ktToMs = 0.514444;
+  if (mission === 3) {
+    const base = 26;
+    const gust =
+      7 * Math.sin((t / 9) * Math.PI * 2 + 0.6) +
+      4 * Math.sin((t / 23) * Math.PI * 2 + 2.1);
+    const speedKt = base + gust;
+    // From the west (270 deg): the air moves toward the east (+x).
+    const fromRad = (270 * Math.PI) / 180;
+    const toRad = fromRad + Math.PI;
+    const ms = speedKt * ktToMs;
+    return {
+      speedKt,
+      fromDeg: 270,
+      gustKt: gust,
+      x: Math.sin(toRad) * ms,
+      z: Math.cos(toRad) * ms,
+    };
   }
-  return base;
+  const speedKt = 7;
+  const fromRad = (315 * Math.PI) / 180; // from the north-west
+  const toRad = fromRad + Math.PI;
+  const ms = speedKt * ktToMs;
+  return {
+    speedKt,
+    fromDeg: 315,
+    gustKt: 0,
+    x: Math.sin(toRad) * ms,
+    z: Math.cos(toRad) * ms,
+  };
 }
 
-// Distance from a point to the runway centreline, and whether it is over the strip.
-export function runwayFrame(px, pz) {
-  const dx = px - RUNWAY.x, dz = pz - RUNWAY.z;
-  const along = -dz; // north is -z; positive along = past the threshold
-  const across = dx;
-  const overStrip = Math.abs(across) <= RUNWAY.width / 2 + 30
-    && along >= -RUNWAY.length / 2 - 120 && along <= RUNWAY.length / 2 + 120;
-  return { along, across, overStrip };
+// Crosswind component on the runway, in knots. The runway points north,
+// so the east-west part of the wind is the crosswind.
+export function crosswindKt(mission, t) {
+  const w = windAt(mission, t);
+  return Math.abs(w.x) / 0.514444;
 }
 
-// Clouds: seeded puffs floating over the island, drawn as soft ellipses.
-export const CLOUDS = (() => {
-  const rand = mulberry32(WORLD.seed + 77);
-  const out = [];
-  for (let i = 0; i < 18; i++) {
-    const a = rand() * Math.PI * 2;
-    const d = 900 + rand() * 4200;
-    out.push({
-      x: Math.cos(a) * d,
-      z: Math.sin(a) * d,
-      y: 520 + rand() * 260,
-      size: 120 + rand() * 200,
-      shade: 0.75 + rand() * 0.25,
+// Scenery, generated once from a fixed seed so every run matches.
+function buildScenery() {
+  const rng = makeRng(20261126);
+  const trees = [];
+  for (let i = 0; i < 240; i++) {
+    const x = range(rng, -2300, 2300);
+    const z = range(rng, -2300, 2300);
+    const h = terrainHeight(x, z);
+    if (h < 14 || h > 210) continue;
+    if (onRunway(x, z)) continue;
+    if (Math.hypot(x - VOLCANO.x, z - VOLCANO.z) < 320) continue;
+    trees.push({ x, z, y: h, size: range(rng, 7, 15), shade: range(rng, 0.75, 1) });
+  }
+  const clouds = [];
+  for (let i = 0; i < 16; i++) {
+    clouds.push({
+      x: range(rng, -3200, 3200),
+      y: range(rng, 330, 560),
+      z: range(rng, -3200, 3200),
+      size: range(rng, 130, 320),
+      speed: range(rng, 4, 9),
+      shade: range(rng, 0.82, 1),
     });
   }
-  return out;
-})();
+  return { trees, clouds };
+}
 
-// Scattered pine copses and beach palms, for the terrain painter to dot in.
-export const TREES = (() => {
-  const rand = mulberry32(WORLD.seed + 55);
-  const out = [];
-  for (let i = 0; i < 340; i++) {
-    const a = rand() * Math.PI * 2;
-    const d = Math.sqrt(rand()) * (WORLD.islandRadius - 300);
-    const x = Math.cos(a) * d, z = Math.sin(a) * d;
-    const h = groundHeight(x, z);
-    if (h > 14 && h < 290) out.push({ x, z, h, s: 7 + rand() * 9 });
-  }
-  return out;
-})();
+export const SCENERY = buildScenery();
 
-export function peakGlow() { return peakRand(); }
+// A smoke puff above the crater, as a pure function of time. Each puff
+// rises, grows, fades, and is carried downwind; looping every 26 s.
+export function smokePuff(i, t) {
+  const cycle = 26;
+  const age = ((t * 0.9 + i * (cycle / 22)) % cycle) / cycle; // 0..1
+  const wind = windAt(3, t);
+  const rise = age * 260;
+  return {
+    x: CRATER.x + wind.x * age * 14 + Math.sin(i * 2.4 + age * 5) * 22,
+    y: CRATER.y + rise,
+    z: CRATER.z + wind.z * age * 14 + Math.cos(i * 1.7 + age * 4) * 22,
+    radius: 26 + age * 64,
+    alpha: 0.5 * (1 - age) * (0.55 + 0.45 * Math.sin(i * 3.1)),
+  };
+}
+export const SMOKE_PUFFS = 22;

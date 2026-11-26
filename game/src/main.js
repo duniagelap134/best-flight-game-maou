@@ -1,207 +1,259 @@
-// Ember Isle — Golden Hour Run: the game loop, the screens and the states.
-// Title, flying, paused, landed and crashed, plus deterministic screenshot
-// poses (?shot=start|play|low|landed) that set the scene up exactly, so the
-// cover and the play shots are real renders of this code in a browser.
-
-import { newFlight, stepFlight } from './physics.js';
-import { renderScene, drawJet } from './render.js';
-import { drawHud, drawTitle, drawPaused, drawLanded, drawCrashed } from './hud.js';
-import { createInput } from './input.js';
+// Ember Isle — Golden Hour Run: the game loop.
+// Owns the mission state, the fixed-step physics loop, the screenshot
+// poses (?shot=start|play|storm|low|landed) and the test autopilot
+// (?auto=1), which flies the course hands-free for verification.
+import { createFlight, stepFlight } from './physics.js';
+import { render } from './render.js';
+import { drawHud } from './hud.js';
 import { createAudio } from './audio.js';
-import { RINGS, RUNWAY, groundHeight, ringAt } from './world.js';
-import { clamp } from './rng.js';
+import { createInput } from './input.js';
+import { RUNWAY, terrainHeight, windAt } from './world.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
-const input = createInput(canvas);
-const audio = createAudio();
+const params = new URLSearchParams(location.search);
+const AUTO = params.get('auto') === '1';
+const SHOT = params.get('shot') || '';
+const FREEZE = params.get('freeze') === '1';
 
-let flight = newFlight('ringRun');
-let missionId = 'ringRun';
-let lastTime = performance.now();
-let screenTime = 0; // wall-clock seconds since load, for animation only
+const audio = createAudio();
+const input = createInput(canvas);
+
+let flight = null;
 let lastRings = 0;
-let lastState = 'title';
+let lastMode = '';
 
 function resize() {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.round(window.innerWidth * dpr);
-  canvas.height = Math.round(window.innerHeight * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
 }
 window.addEventListener('resize', resize);
 resize();
 
-function width() { return window.innerWidth; }
-function height() { return window.innerHeight; }
-
-function startMission(id) {
-  missionId = id;
-  for (const ring of RINGS) { ring.passed = false; ring.nearMissed = false; ring.comboLost = false; }
-  flight = newFlight(id);
-  flight.state = 'flying';
-  flight.throttle = 0.55;
+function startMission(mission) {
+  flight = createFlight(mission);
   lastRings = 0;
-  lastState = 'flying';
-  audio.unlock();
-  setStatus('Flying. Thread the gold rings, then land on runway 18.');
+  lastMode = 'flying';
+  audio.ensure();
+  input.clearPressed();
 }
 
-function restart() {
-  startMission(missionId);
+// The title screen flies a slow camera over the island.
+function titleFlight() {
+  const f = createFlight(1);
+  f.mode = 'title';
+  f.pos = { x: -400, y: 430, z: -2700 };
+  f.heading = 0.35;
+  f.pitch = -0.06;
+  f.roll = 0;
+  f.speed = 0;
+  f.time = 0;
+  return f;
 }
 
-function setStatus(text) {
-  if (statusEl) statusEl.textContent = text;
-}
+flight = titleFlight();
 
-// ---- Deterministic screenshot poses -------------------------------------
-// ?shot=start  — title screen, jet parked on the runway at golden hour
-// ?shot=play   — mid-flight, banked toward ring 3 over the valley, HUD lit
-// ?shot=low    — low on final approach, runway lights ahead, 7 rings done
-// ?shot=landed — wheels down, win screen with the score breakdown
-// ?shot=storm  — Storm Front mid-flight, wind panel lit, rain in the frame
-// The poses only set state the game itself can reach; the render path is the
-// same one the player sees.
+// Deterministic poses for the screenshots. Each one is a fixed moment in
+// a flight, so the four pictures show the game honestly.
 function applyShot(shot) {
-  if (!shot) return;
   if (shot === 'start') {
-    flight = newFlight('ringRun');
-    flight.state = 'title';
-    flight.throttle = 0.35;
-    screenTime = 6;
+    flight = titleFlight();
     return;
   }
   if (shot === 'play') {
-    startMission('ringRun');
-    // North of ring 3, heading south toward it: the gold ring sits dead
-    // ahead over the valley, with the sun low to the right.
-    flight.x = -260; flight.z = -120;
-    flight.y = 210;
-    flight.heading = 2.96; flight.pitch = 0.02; flight.roll = -0.3;
-    flight.speed = 168; flight.throttle = 0.78; flight.fuel = 74;
-    flight.ringsPassed = 2; flight.nextRing = 2;
-    RINGS[0].passed = true; RINGS[1].passed = true;
-    flight.score = 540; flight.time = 96;
-    return;
-  }
-  if (shot === 'low') {
-    startMission('ringRun');
-    flight.x = 330; flight.z = 2950;
-    flight.y = 122;
-    flight.heading = 0.02; flight.pitch = -0.06; flight.roll = 0.04;
-    flight.speed = 132; flight.throttle = 0.42; flight.fuel = 31;
-    flight.ringsPassed = 7; flight.nextRing = 7;
-    for (let i = 0; i < 7; i++) RINGS[i].passed = true;
-    flight.score = 1980; flight.time = 243;
-    return;
-  }
-  if (shot === 'landed') {
-    startMission('ringRun');
-    flight.x = RUNWAY.x; flight.z = RUNWAY.z + 120;
-    flight.y = groundHeight(RUNWAY.x, RUNWAY.z + 120) + 1.5;
-    flight.heading = 0; flight.speed = 0; flight.throttle = 0;
-    flight.fuel = 18; flight.time = 312;
-    flight.ringsPassed = 8; flight.nextRing = 8;
-    for (const ring of RINGS) ring.passed = true;
-    flight.score = 3420;
-    flight.landingQuality = 92;
-    flight.maxCombo = 8; flight.combo = 8;
-    flight.crosswindAtLanding = 5; flight.landingAcross = 2;
-    flight.state = 'landed';
+    flight = createFlight(1);
+    flight.time = 24;
+    flight.pos = { x: 30, y: 185, z: -760 };
+    flight.heading = 0.12;
+    flight.pitch = 0.02;
+    flight.speed = 58;
+    flight.groundSpeed = 58;
+    flight.throttle = 0.72;
+    flight.fuel = 88;
+    flight.ringsScored = 1;
+    flight.ringsHit[0] = true;
+    flight.ringIndex = 1;
+    flight.score = 300;
     return;
   }
   if (shot === 'storm') {
-    // Storm Front mid-flight: banked toward the crosswind ring 3, combo x2,
-    // the wind panel lit and rain streaking across the frame. The pose only
-    // sets state the game itself can reach; the render path is the same one
-    // the player sees.
-    startMission('stormFront');
-    flight.x = -420; flight.z = -60;
-    flight.y = 240;
-    flight.heading = 2.85; flight.pitch = 0.02; flight.roll = -0.35;
-    flight.speed = 172; flight.throttle = 0.82; flight.fuel = 81;
-    flight.ringsPassed = 2; flight.nextRing = 2;
-    flight.combo = 2; flight.maxCombo = 2;
-    RINGS[0].passed = true; RINGS[1].passed = true;
-    flight.score = 720; flight.time = 74;
+    flight = createFlight(3);
+    flight.time = 34;
+    flight.pos = { x: 96, y: 178, z: -300 };
+    flight.heading = 0.08;
+    flight.pitch = 0.02;
+    flight.speed = 54;
+    flight.groundSpeed = 54;
+    flight.throttle = 0.78;
+    flight.fuel = 91;
+    flight.ringsScored = 2;
+    flight.ringsHit[0] = true;
+    flight.ringsHit[1] = true;
+    flight.ringIndex = 2;
+    flight.combo = 2;
+    flight.bestCombo = 2;
+    flight.score = 660;
+    return;
+  }
+  if (shot === 'low') {
+    flight = createFlight(1);
+    flight.time = 92;
+    flight.pos = { x: 6, y: 62, z: -2650 };
+    flight.heading = 0.02;
+    flight.pitch = -0.04;
+    flight.speed = 52;
+    flight.groundSpeed = 52;
+    flight.throttle = 0.5;
+    flight.fuel = 41;
+    flight.ringsScored = 5;
+    for (let i = 0; i < 5; i++) flight.ringsHit[i] = true;
+    flight.ringIndex = 5;
+    flight.score = 1875;
+    return;
+  }
+  if (shot === 'landed') {
+    flight = createFlight(1);
+    flight.mode = 'landed';
+    flight.time = 128;
+    flight.pos = { x: 2, y: RUNWAY.elevation + 1.5, z: -1750 };
+    flight.heading = 0;
+    flight.speed = 0;
+    flight.throttle = 0;
+    flight.fuel = 22;
+    flight.ringsScored = 8;
+    flight.ringsHit = flight.ringsHit.map(() => true);
+    flight.ringIndex = 8;
+    flight.bestCombo = 8;
+    flight.combo = 8;
+    flight.score = 4017;
+    flight.landedQuality = 82;
+    flight.offCentre = 2;
+    flight.crosswindAtLanding = 5;
     return;
   }
 }
 
-const params = new URLSearchParams(window.location.search);
-applyShot(params.get('shot'));
+if (SHOT) applyShot(SHOT);
 
-// A tiny debug handle for playtesting: window.__ember exposes the live state
-// and lets a test drive the game. It changes nothing the player sees.
-window.__ember = {
-  flight: () => flight,
-  start: startMission,
-  shot: applyShot,
-  rings: () => RINGS.map((r, i) => { const p = ringAt(i, missionId); return { x: p.x, y: p.y, z: p.z, passed: p.passed }; }),
-  ground: (x, z) => groundHeight(x, z),
-};
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
 
-// ---- Main loop ------------------------------------------------------------
+// Hands-free flying for the live playtest: steer at the next ring, then
+// line up on the runway and put it down.
+function autopilot() {
+  if (!flight || flight.mode !== 'flying') return { pitch: 0, roll: 0, throttle: 0 };
+  let target;
+  if (flight.ringIndex < flight.rings.length) {
+    target = flight.rings[flight.ringIndex];
+  } else if (flight.pos.z < -2050) {
+    target = { x: 0, y: RUNWAY.elevation + 6, z: -2200 };
+  } else {
+    target = { x: 0, y: RUNWAY.elevation + 6, z: -2050 };
+  }
+  const dx = target.x - flight.pos.x;
+  const dy = target.y - flight.pos.y;
+  const dz = target.z - flight.pos.z;
+  const desiredHeading = Math.atan2(dx, dz);
+  const err = wrapAngle(desiredHeading - flight.heading);
+  const roll = Math.max(-1, Math.min(1, err * 1.4));
+  const dist = Math.hypot(dx, dz);
+  // Descend gradually: the pitch target is scaled by distance, so a ring
+  // 30 m below you 500 m away is a gentle glide, not a dive.
+  let pitch = Math.max(-0.6, Math.min(0.6, dy / Math.max(90, Math.min(400, dist * 0.6))));
+  let throttle = 0.55;
+  if (flight.ringIndex >= flight.rings.length) {
+    // Final: fly south down the centreline, not at a point. Aim a touch
+    // west when east of the line (and vice versa), so the correction can
+    // never cancel the heading error. Bleed speed to ~45 m/s, descend at
+    // about -8 m/s, flare under 26 m.
+    const wind = windAt(flight.mission, flight.time);
+    const comp = Math.asin(Math.max(-0.6, Math.min(0.6, wind.x / Math.max(30, flight.speed))));
+    const desired = Math.PI + comp + Math.max(-0.3, Math.min(0.3, flight.pos.x / 150));
+    const rollF = Math.max(-1, Math.min(1, wrapAngle(desired - flight.heading) * 1.6));
+    if (flight.speed > 58) {
+      return { pitch: 0.15, roll: rollF, throttle: -0.7 };
+    }
+    if (flight.pos.y > 14) {
+      // Do not descend until over the strip: level off and crab back to
+      // the centreline first, or the storm puts you in the rough.
+      if (Math.abs(flight.pos.x) > 25 && flight.pos.y > 60 && flight.speed > 35) {
+        return { pitch: 0, roll: rollF, throttle: flight.speed > 48 ? -0.5 : flight.speed < 38 ? 0.4 : 0 };
+      }
+      return { pitch: -0.35, roll: rollF, throttle: flight.speed > 48 ? -0.5 : flight.speed < 38 ? 0.4 : 0 };
+    }
+    return { pitch: -0.2, roll: rollF, throttle: -0.6 };
+  }
+  if (flight.speed < 42) {
+    throttle = 0.9;
+  } else if (flight.ringIndex === 7 && flight.speed > 70) {
+    throttle = -0.5;
+  }
+  return { pitch, roll, throttle };
+}
+
+let last = performance.now();
+let accumulator = 0;
+const STEP = 1 / 60;
+
 function frame(now) {
-  const dt = clamp((now - lastTime) / 1000, 0.001, 0.05);
-  lastTime = now;
-  screenTime += dt;
-  const w = width(), h = height();
-
-  input.applyMouse(w, h);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
 
   // One-shot keys.
-  if (input.consume('Enter')) {
-    audio.unlock();
-    if (flight.state === 'title' || flight.state === 'landed' || flight.state === 'crashed') {
-      startMission(missionId);
+  if (input.take('1')) startMission(1);
+  if (input.take('2')) startMission(2);
+  if (input.take('3')) startMission(3);
+  if (input.take('p') || input.take('P')) {
+    if (flight.mode === 'flying') flight.mode = 'paused';
+    else if (flight.mode === 'paused') flight.mode = 'flying';
+  }
+  if (input.take('r') || input.take('R')) {
+    if (flight.mode !== 'title') startMission(flight.mission);
+  }
+  if (input.take('m') || input.take('M')) audio.toggleMute();
+  if (input.take('Escape') && flight.mode === 'paused') flight.mode = 'flying';
+
+  if (!FREEZE) {
+    if (flight.mode === 'title') {
+      flight.time += dt;
+      flight.heading += dt * 0.02;
+    } else if (flight.mode === 'flying') {
+      input.poll();
+      const control = AUTO ? autopilot() : input;
+      const before = flight.ringsScored;
+      accumulator += dt;
+      while (accumulator >= STEP) {
+        stepFlight(flight, control, STEP);
+        accumulator -= STEP;
+        if (flight.mode !== 'flying') break;
+      }
+      if (flight.ringsScored > before) audio.ring();
+      if (flight.mode === 'landed' || flight.mode === 'crashed') audio.thud();
+      audio.update(flight.throttle, flight.speed, flight.mode === 'flying');
     }
   }
-  if (input.consume('KeyR')) restart();
-  if (input.consume('KeyP') || input.consume('Escape')) {
-    if (flight.state === 'flying') { flight.state = 'paused'; setStatus('Paused.'); }
-    else if (flight.state === 'paused') { flight.state = 'flying'; setStatus('Flying.'); }
-  }
-  if (input.consume('KeyM')) {
-    audio.unlock();
-    const muted = audio.toggleMute();
-    setStatus(muted ? 'Sound muted.' : 'Sound on.');
-  }
-  if (flight.state === 'title') {
-    if (input.consume('Digit1')) missionId = 'ringRun';
-    if (input.consume('Digit2')) missionId = 'timeTrial';
-    if (input.consume('Digit3')) missionId = 'stormFront';
-  }
 
-  // Physics, only while flying.
-  if (flight.state === 'flying') {
-    const before = flight.ringsPassed;
-    stepFlight(flight, input, dt);
-    if (flight.ringsPassed > before) audio.chime();
-    if (flight.state === 'crashed') { audio.thud(true); setStatus(`Crashed: ${flight.crashReason}`); }
-    if (flight.state === 'landed') { audio.thud(false); setStatus(`Landed. Score ${flight.score}.`); }
-    lastRings = flight.ringsPassed;
-  }
-  audio.update(flight.throttle, flight.speed, flight.state === 'flying');
+  render(ctx, flight, canvas.width, canvas.height);
+  drawHud(ctx, flight, canvas.width, canvas.height);
 
-  // Render: the world, then the HUD, then the jet in front of the HUD's
-  // horizon ball, then the screen for the state. The end screens carry their
-  // own score lines, so they skip the HUD and stay readable.
-  ctx.clearRect(0, 0, w, h);
-  renderScene(ctx, w, h, flight, screenTime);
-  if (flight.state === 'flying' || flight.state === 'paused') {
-    drawHud(ctx, w, h, flight, screenTime);
+  const label =
+    flight.mode === 'title'
+      ? 'Ember Isle — Golden Hour Run. Press 1, 2 or 3 to choose a mission.'
+      : `Score ${flight.score}. Rings ${flight.ringsScored} of 8. ` +
+        `Speed ${Math.round(flight.speed * 1.94)} knots. ` +
+        `Altitude ${Math.round(flight.pos.y * 3.28)} feet. Fuel ${Math.round(flight.fuel)} percent. ` +
+        (flight.mode === 'landed' ? `Landed, quality ${flight.landedQuality}.` : '') +
+        (flight.mode === 'crashed' ? `Crashed. ${flight.crashReason}` : '');
+  if (label !== lastMode) {
+    statusEl.textContent = label;
+    lastMode = label;
   }
-  drawJet(ctx, w, h, flight, screenTime);
-  if (flight.state === 'title') drawTitle(ctx, w, h, flight, screenTime, missionId);
-  if (flight.state === 'paused') drawPaused(ctx, w, h, flight);
-  if (flight.state === 'landed') drawLanded(ctx, w, h, flight);
-  if (flight.state === 'crashed') drawCrashed(ctx, w, h, flight);
-
-  if (flight.state !== lastState) lastState = flight.state;
-  void lastRings;
   requestAnimationFrame(frame);
 }
+
+canvas.addEventListener('pointerdown', () => audio.ensure());
 requestAnimationFrame(frame);
